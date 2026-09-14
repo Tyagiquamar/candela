@@ -214,18 +214,22 @@ func (c *Calculator) Calculate(provider, model string, inputTokens, outputTokens
 
 	// Select pricing tier. Models with TierThresholdTokens > 0 charge higher
 	// rates when the prompt exceeds that threshold (e.g. Gemini 2.5 Pro >200K).
-	inputRate := p.InputPerMillion
-	outputRate := p.OutputPerMillion
-	if p.TierThresholdTokens > 0 && inputTokens > p.TierThresholdTokens {
-		if p.InputPerMillionHigh > 0 {
-			inputRate = p.InputPerMillionHigh
-		}
-		if p.OutputPerMillionHigh > 0 {
-			outputRate = p.OutputPerMillionHigh
-		}
+	// The tier 1 rate applies to tokens up to the threshold, and the high-tier
+	// rate applies only to the overflow tokens (#638).
+	var inputCost float64
+	if p.TierThresholdTokens > 0 && inputTokens > p.TierThresholdTokens && p.InputPerMillionHigh > 0 {
+		baseTokens := p.TierThresholdTokens
+		overflowTokens := inputTokens - p.TierThresholdTokens
+		inputCost = (float64(baseTokens) / 1_000_000 * p.InputPerMillion) +
+			(float64(overflowTokens) / 1_000_000 * p.InputPerMillionHigh)
+	} else {
+		inputCost = float64(inputTokens) / 1_000_000 * p.InputPerMillion
 	}
 
-	inputCost := float64(inputTokens) / 1_000_000 * inputRate
+	outputRate := p.OutputPerMillion
+	if p.TierThresholdTokens > 0 && inputTokens > p.TierThresholdTokens && p.OutputPerMillionHigh > 0 {
+		outputRate = p.OutputPerMillionHigh
+	}
 	outputCost := float64(outputTokens) / 1_000_000 * outputRate
 	baseCost := inputCost + outputCost
 
@@ -542,8 +546,10 @@ func (c *Calculator) Resolve(provider, model string) (ModelPricing, bool) {
 
 // ResolveEffective returns the pricing that would be used for the given token counts,
 // accounting for tiered pricing. This captures the actual rates for cost auditing.
-// When the input context exceeds the tier threshold, the high-tier rates are returned
-// in InputPerMillion/OutputPerMillion so the snapshot reflects what was actually charged.
+// When the input context exceeds the tier threshold, the effective weighted input rate
+// (threshold tokens at base rate + overflow tokens at high rate, divided by total input tokens)
+// and high-tier output rate are returned in InputPerMillion/OutputPerMillion so the snapshot
+// reflects what was actually charged (#638).
 func (c *Calculator) ResolveEffective(provider, model string, inputTokens int64) (ModelPricing, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -551,10 +557,12 @@ func (c *Calculator) ResolveEffective(provider, model string, inputTokens int64)
 	if !ok {
 		return p, false
 	}
-	// Apply tiered pricing selection (same logic as Calculate).
+	// Apply tiered pricing selection (same marginal logic as Calculate).
 	if p.TierThresholdTokens > 0 && inputTokens > p.TierThresholdTokens {
-		if p.InputPerMillionHigh > 0 {
-			p.InputPerMillion = p.InputPerMillionHigh
+		if p.InputPerMillionHigh > 0 && inputTokens > 0 {
+			baseTokens := float64(p.TierThresholdTokens)
+			overflowTokens := float64(inputTokens - p.TierThresholdTokens)
+			p.InputPerMillion = ((baseTokens * p.InputPerMillion) + (overflowTokens * p.InputPerMillionHigh)) / float64(inputTokens)
 		}
 		if p.OutputPerMillionHigh > 0 {
 			p.OutputPerMillion = p.OutputPerMillionHigh
