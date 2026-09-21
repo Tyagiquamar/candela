@@ -184,6 +184,9 @@ Non-admin developers can only see their own traces and spans. This is enforced a
 The `scopeUserID()` helper (`pkg/connecthandlers/scope.go`) determines the caller's identity:
 - **Admin** → returns `""` (empty string = no filter, sees all data)
 - **Developer** → returns sanitized email (e.g., `alice@example.com`)
+- **Unauthenticated (Production)** → **Fails closed** with `connect.CodeUnauthenticated` (`401`, #627)
+- **Unauthenticated (Dev Mode)** → returns `""` (local development bypass when explicitly marked via `auth.WithDevMode`)
+- **No UserStore Configured** → returns `""` (unscoped local dev mode without user database)
 
 This value is injected into `TraceQuery.UserID`, `SpanQuery.UserID`, or `UsageQuery.UserID`. All storage backends (BigQuery, DuckDB, SQLite) apply the filter in SQL:
 
@@ -195,11 +198,12 @@ AND (? = '' OR user_id = ?)
 
 `GetTrace` cannot pre-filter because it queries by `trace_id`, not user. Instead, it uses a **post-fetch authorization gate**:
 
-1. Fetch the full trace from storage
-2. Extract the trace owner via `traceUserID()` — checks root span first, then falls back to any span with `user_id`
-3. Compare against `scopeUserID(ctx)`
-4. If mismatch → `PermissionDenied`
-5. If no `user_id` on any span (legacy data) → allow access, log for backfill visibility
+1. Call `scopeUserID(ctx)` — fails closed immediately if unauthenticated in production mode
+2. Fetch the full trace from storage using user-scoped context
+3. Extract the trace owner via `traceUserID()` — checks root span first, then falls back to any span with `user_id`
+4. Compare against `scopeUserID(ctx)` result
+5. If mismatch → `PermissionDenied`
+6. If no `user_id` on any span (legacy data) → allow access, log for backfill visibility
 
 ### Error Sanitization
 
@@ -375,20 +379,32 @@ See [docs/user-management.md](user-management.md) for the full validation rule r
 | ADC token auto-refresh | ✅ | `oauth2.TokenSource` handles refresh |
 | API key hashing (bcrypt) | ✅ | `APIKey.KeyHash` never exposed |
 | Proxy does not store upstream API keys | ✅ | Forwarded transparently |
-| CORS origin allowlist | ✅ | Configurable, defaults to localhost |
+| CORS origin allowlist | ✅ | Configurable, defaults to localhost; warns on wildcard (#628) |
 | Firebase authorized domains | ⚠️ | Must be configured in Firebase Console |
 | HTTPS in production | ⚠️ | Handled by Cloud Run / load balancer |
 | Audit logging for admin actions | ✅ | Firestore `audit_log` collection |
 
-### v0.7.1 Security Hardening Notes
+### CORS Security Best Practices (#628, #640)
 
-The following issues were identified and resolved in the v0.7.1 security audit:
+- **Outer Middleware Order**: CORS middleware (`corsMiddleware`) wraps authentication middleware (`authedMux`) on the outside. This guarantees that:
+  - Preflight `OPTIONS` requests receive `204 No Content` and CORS headers without requiring authentication.
+  - Authentication rejections (`401 Unauthorized`, `403 Forbidden`) retain `Access-Control-Allow-Origin` headers, allowing browser client applications to receive and handle the specific auth error instead of masking it as an opaque CORS network violation (#640).
+- **Explicit Origins in Production**: Avoid wildcard `*` origins in production deployments. When `*` is configured with credentialed requests, the server reflects the caller's origin while logging a conspicuous warning (`⚠️ CORS configured with wildcard '*' origin`). Always configure explicit origins under `cors.allowed_origins` matching production frontend domains.
+
+### Security Audit Hardening Notes
+
+The following issues were identified and resolved in the security hardening reviews:
 
 | Issue | Severity | Description | Fix |
 |-------|----------|-------------|-----|
 | `GetJobLeaderboard` missing authorization | **HIGH** | The `GetJobLeaderboard` RPC had no authorization check, allowing any authenticated user to query the leaderboard for all users. | Added an in-handler `scopeUserID` guard that returns `PermissionDenied` for non-admin callers (see `dashboard_handler.go`). |
 | `UpdateUser` role escalation bypass | **MEDIUM-HIGH** | A developer-role user could call `UpdateUser` on their own record with `role: ADMIN` to escalate privileges. The admin guard only checked if the caller was admin for *other* users, not for self-updates. | Self-updates now reject `role` field changes; only admins can modify roles. |
 | Catalog `AdminEditable` UI leak | **MEDIUM** | The model catalog API returned `admin_editable: true/false` metadata to all users, leaking which fields are admin-configurable. While not directly exploitable, it reveals internal authorization boundaries. | `admin_editable` field is now stripped from responses for non-admin callers. |
+| `scopeUserID` fail-open on nil context | **MEDIUM** (MED-10) | `scopeUserID` returned `""` when the auth context was nil, granting admin-level access (fail-open). | Added explicit `dev_mode` check; in non-dev mode a nil caller returns `Unauthenticated` (fail closed, #627). |
+| `/debug/metrics` admin authorization | **MEDIUM** (MED-9) | Metrics endpoint returned sensitive spend and dropped-span counts to unauthenticated or non-admin users. | Restricted to admin users; fails closed with 403 when UserStore is unconfigured in production (#625). |
+| CORS wildcard origin warning | **MEDIUM** (MED-11) | Wildcard CORS origin `*` allowed arbitrary clients to query APIs. | Emits startup warning when `*` is configured and enforces origin reflection; documented best practices (#628). |
+| PR title-based CI gating bypass | **HIGH** (HIGH-10) | `transparent-proxy-e2e` CI job was triggered based on PR titles (`contains(title, 'proxy')`), allowing untrusted PR authors to control execution. | Replaced PR title matching with `dorny/paths-filter` path-based gating (#626). |
+| CORS headers on auth error responses | **MEDIUM** (#640) | Auth error responses (401/403) omitted CORS headers because auth middleware was outer to CORS, masking auth errors as generic browser CORS errors. | Moved `corsMiddleware` outside `authedMux` so all responses retain CORS headers (#640). |
 
 ---
 
