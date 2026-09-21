@@ -40,9 +40,16 @@ type BQLogger struct {
 }
 
 // BQConfig holds BigQuery audit logger configuration.
+//
+// Note: BufferSize makes the event channel buffer capacity configurable (defaulting
+// to 256 when zero or negative). Adding BufferSize is a source-incompatible change
+// for callers constructing unkeyed struct literals; callers must use keyed literals
+// (e.g. BQConfig{ProjectID: "...", Dataset: "...", BufferSize: ...}).
 type BQConfig struct {
-	ProjectID  string
-	Dataset    string
+	ProjectID string
+	Dataset   string
+	// BufferSize sets the channel buffer capacity for asynchronous BigQuery writes.
+	// When zero or negative, a default of 256 is used.
 	BufferSize int
 }
 
